@@ -17,16 +17,26 @@ import (
 	"sort"
 )
 
+// 在 Arena 内部，内存是按 slab 进行管理的。每个 slab 是一个大块的内存区域，slab 内部连续划分为若干个大小相同的 chunk 。
+
+// Slab: 包含多个 chunk，chunk 是 slab 中的基本内存单元。
+// Buf: 从某个 chunk 中分配出来的内存块。
+// Footer: 存储在 buf 末尾的元数据，其中包含 slabClassIndex、slabIndex 和 slabMagic 等信息。
+
+// Loc
 // An opaque reference to bytes managed by an Arena.  See
 // Arena.BufToLoc/LocToBuf().  A Loc struct is GC friendly in that a
 // Loc does not have direct pointer fields into the Arena's memory
 // that the GC's scanner must traverse.
+//
+// Loc 是一个轻量级的数据结构，用于标识在 Arena 内存池中的一个特定位置。
+// 它包含了用于定位和描述内存块的信息，但不直接引用 Arena 的内存，从而使得 Loc 在垃圾回收（GC）过程中是友好的。
 type Loc struct {
-	slabClassIndex int
-	slabIndex      int
-	chunkIndex     int
-	bufStart       int
-	bufLen         int
+	slabClassIndex int // 指向 Arena 中的 slabClass
+	slabIndex      int // 指向 slabClass 中的具体 slab
+	chunkIndex     int // 指向 slab 中的具体 chunk
+	bufStart       int // 在 chunk 中的起始偏移量
+	bufLen         int // 表示有效数据的长度
 }
 
 // NilLoc returns a Loc where Loc.IsNil() is true.
@@ -38,8 +48,11 @@ var nilLoc = Loc{-1, -1, -1, -1, -1} // A sentinel.
 
 // IsNil returns true if the Loc came from NilLoc().
 func (cl Loc) IsNil() bool {
-	return cl.slabClassIndex < 0 && cl.slabIndex < 0 &&
-		cl.chunkIndex < 0 && cl.bufStart < 0 && cl.bufLen < 0
+	return cl.slabClassIndex < 0 &&
+		cl.slabIndex < 0 &&
+		cl.chunkIndex < 0 &&
+		cl.bufStart < 0 &&
+		cl.bufLen < 0
 }
 
 // Slice returns a Loc that a represents a different slice of the
@@ -59,12 +72,18 @@ func (cl Loc) Slice(bufStart, bufLen int) Loc {
 
 // An Arena manages a set of slab classes and memory.
 type Arena struct {
+	// 控制 slabClass 的增长因子
 	growthFactor float64
-	slabClasses  []slabClass // slabClasses's chunkSizes grow by growthFactor.
-	slabMagic    int32       // Magic # suffix on each slab memory []byte.
-	slabSize     int
-	malloc       func(size int) []byte // App-specific allocator.
+	// 包含多个 slabClass 实例，每个实例管理不同大小的内存块
+	slabClasses []slabClass // slabClasses's chunkSizes grow by growthFactor.
+	// 一个魔数，用于验证内存块的合法性
+	slabMagic int32 // Magic # suffix on each slab memory []byte.
+	// 每个 slab 的大小
+	slabSize int
+	// 分配内存的函数（可自定义）
+	malloc func(size int) []byte // App-specific allocator.
 
+	// 记录内存分配、引用管理和错误情况的各种统计信息
 	totAllocs           int64
 	totAddRefs          int64
 	totDecRefs          int64
@@ -81,29 +100,40 @@ type Arena struct {
 }
 
 type slabClass struct {
-	slabs     []*slab // A growing array of slabs.
-	chunkSize int     // Each slab is sliced into fixed-sized chunks.
-	chunkFree Loc     // Chunks are tracked in a free-list per slabClass.
+	// 包含多个 slab 实例
+	slabs []*slab // A growing array of slabs.
+	// 每个 chunk 的大小
+	chunkSize int // Each slab is sliced into fixed-sized chunks.
+	// 空闲 chunk 的链表
+	chunkFree Loc // Chunks are tracked in a free-list per slabClass.
 
-	numChunks     int64
+	// 总的 chunk 数量
+	numChunks int64
+	// 空闲 chunk 数量
 	numChunksFree int64
 }
 
+// slab 是内存块的容器，将内存分成多个 chunk，并包含 chunk 的元数据。
 type slab struct {
 	// len(memory) == slabSize + slabMemoryFooterLen.
+	// 实际的内存数据
 	memory []byte
-
 	// Matching array of chunk metadata, and len(memory) == len(chunks).
+	// chunk 元数据
 	chunks []chunk
 }
 
 // Based on slabClassIndex + slabIndex + slabMagic.
 const slabMemoryFooterLen int = 4 + 4 + 4
 
+// 内存块的基本单元，具有引用计数和链表信息
 type chunk struct {
+	// 引用计数
 	refs int32 // Ref-count.
-	self Loc   // The self is the Loc for this chunk.
-	next Loc   // Used when chunk is in the free-list or when chained.
+	// 指向 chunk 自身的 Loc
+	self Loc // The self is the Loc for this chunk.
+	// 指向下一个 chunk 的 Loc，用于链表
+	next Loc // Used when chunk is in the free-list or when chained.
 }
 
 // NewArena returns an Arena to manage byte slice memory based on a
@@ -113,7 +143,12 @@ type chunk struct {
 // The growthFactor should be > 1.0.
 // The malloc() func is invoked when Arena needs memory for a new slab.
 // When malloc() is nil, then Arena defaults to make([]byte, size).
-func NewArena(startChunkSize int, slabSize int, growthFactor float64,
+//
+// 创建一个新的 Arena 实例
+func NewArena(
+	startChunkSize int,
+	slabSize int,
+	growthFactor float64,
 	malloc func(size int) []byte) *Arena {
 	if malloc == nil {
 		malloc = defaultMalloc
@@ -136,6 +171,8 @@ func defaultMalloc(size int) []byte {
 // available and new slab memory was not allocatable (such as if
 // malloc() returns nil).  The returned buf may not be append()'ed to
 // for growth.  The returned buf must be DecRef()'ed for memory reuse.
+//
+// 分配内存块，并返回指向内存块的字节切片
 func (s *Arena) Alloc(bufLen int) (buf []byte) {
 	sc, chunk := s.allocChunk(bufLen)
 	if sc == nil || chunk == nil {
@@ -145,6 +182,8 @@ func (s *Arena) Alloc(bufLen int) (buf []byte) {
 }
 
 // Owns returns true if this Arena owns the buf.
+//
+// 检查一个字节切片是否属于该 Arena
 func (s *Arena) Owns(buf []byte) bool {
 	sc, c := s.bufChunk(buf)
 	return sc != nil && c != nil
@@ -152,6 +191,8 @@ func (s *Arena) Owns(buf []byte) bool {
 
 // AddRef increase the ref count on a buf.  The input buf must be from
 // an Alloc() from the same Arena.
+//
+// 管理内存块的引用计数
 func (s *Arena) AddRef(buf []byte) {
 	s.totAddRefs++
 	sc, c := s.bufChunk(buf)
@@ -165,6 +206,8 @@ func (s *Arena) AddRef(buf []byte) {
 // from an Alloc() from the same Arena.  Once the buf's ref-count
 // drops to 0, the Arena may reuse the buf.  Returns true if this was
 // the last DecRef() invocation (ref count reached 0).
+//
+// 管理内存块的引用计数
 func (s *Arena) DecRef(buf []byte) bool {
 	s.totDecRefs++
 	sc, c := s.bufChunk(buf)
@@ -179,6 +222,8 @@ func (s *Arena) DecRef(buf []byte) bool {
 // be nil.  When the returned bufNext is non-nil, the caller owns a
 // ref-count on bufNext and must invoke DecRef(bufNext) when the
 // caller is finished using bufNext.
+//
+// 管理内存块的链表关系
 func (s *Arena) GetNext(buf []byte) (bufNext []byte) {
 	s.totGetNexts++
 	sc, c := s.bufChunk(buf)
@@ -237,6 +282,8 @@ func (s *Arena) SetNext(buf, bufNext []byte) {
 // BufToLoc returns a Loc that represents an Arena-managed buf.  Does
 // not affect the reference count of the buf.  The buf slice must have
 // start position 0 (must not be a sliced Loc with non-zero bufStart).
+//
+// 在字节切片和 Loc 之间转换
 func (s *Arena) BufToLoc(buf []byte) Loc {
 	sc, c := s.bufChunk(buf)
 	if sc == nil || c == nil {
@@ -280,6 +327,8 @@ func (s *Arena) LocDecRef(loc Loc) {
 
 // ---------------------------------------------------------------
 
+// 分配一个合适的 chunk，根据 bufLen 找到合适的 slabClass 。
+// 如果没有空闲 chunk，则会尝试添加新的 slab。
 func (s *Arena) allocChunk(bufLen int) (*slabClass, *chunk) {
 	s.totAllocs++
 
@@ -288,8 +337,15 @@ func (s *Arena) allocChunk(bufLen int) (*slabClass, *chunk) {
 		return nil, nil
 	}
 
+	// 查找适合当前 bufLen 的 slabClass ，slabClass 代表了一组大小相同的 chunk 。
 	slabClassIndex := s.findSlabClassIndex(bufLen)
 	sc := &(s.slabClasses[slabClassIndex])
+
+	// 接着，检查 slabClass 的 chunkFree 列表是否有可用的 chunk
+
+	// 如果 slabClass 的 chunkFree 列表为空，表示没有可用的 chunk 。
+	// 这时，Arena 会调用 addSlab 方法添加新的 slab，从而增加可用的 chunk。
+	// 如果 addSlab 失败，则记录错误并返回 nil 。
 	if sc.chunkFree.IsNil() {
 		if !s.addSlab(slabClassIndex, s.slabSize, s.slabMagic) {
 			s.totAddSlabErrs++
@@ -297,6 +353,8 @@ func (s *Arena) allocChunk(bufLen int) (*slabClass, *chunk) {
 		}
 	}
 
+	// 如果 chunkFree 列表中有空闲的 chunk，则从中弹出一个，并记录成功的分配操作。
+	// 如果弹出失败，记录错误并返回 nil。
 	s.totPopFreeChunks++
 	chunk := sc.popFreeChunk()
 	if chunk == nil {
@@ -304,21 +362,33 @@ func (s *Arena) allocChunk(bufLen int) (*slabClass, *chunk) {
 		return nil, nil
 	}
 
+	// 成功分配，返回 chunk 和 slabClass
 	return sc, chunk
 }
 
+// 确定适合给定 bufLen 的 slabClass 索引。如果当前没有适合的 slabClass，则创建新的 slabClass
 func (s *Arena) findSlabClassIndex(bufLen int) int {
-	i := sort.Search(len(s.slabClasses),
-		func(i int) bool { return bufLen <= s.slabClasses[i].chunkSize })
+	// 二分查找 slabClasses 列表中第一个满足条件的 slabClass
+	i := sort.Search(len(s.slabClasses), func(i int) bool { return bufLen <= s.slabClasses[i].chunkSize })
+
+	// 没有合适的 slabClass ，需要创建一个新的 slabClass
 	if i >= len(s.slabClasses) {
+		// 获取当前列表中的最后一个 slabClass 。
 		slabClass := &(s.slabClasses[len(s.slabClasses)-1])
+		// 计算下一个 chunkSize，它是当前 chunkSize 乘以 growthFactor 。
+		// growthFactor 是一个大于 1 的因子，用于确定下一个 slabClass 的大小。
 		nextChunkSize := float64(slabClass.chunkSize) * s.growthFactor
+		// 添加新的 slabClass 。
+		// 这里的 nextChunkSize 被向上取整，以确保 chunkSize 是一个整数。
 		s.addSlabClass(int(math.Ceil(nextChunkSize)))
+		// 再次查找
 		return s.findSlabClassIndex(bufLen)
 	}
+
 	return i
 }
 
+// 添加新的 slabClass，并初始化 chunkSize
 func (s *Arena) addSlabClass(chunkSize int) {
 	s.slabClasses = append(s.slabClasses, slabClass{
 		chunkSize: chunkSize,
@@ -326,6 +396,8 @@ func (s *Arena) addSlabClass(chunkSize int) {
 	})
 }
 
+// 为指定的 slabClass 添加新的 slab 。
+// 初始化 slab 内存，并将其划分为 chunk 。
 func (s *Arena) addSlab(
 	slabClassIndex, slabSize int, slabMagic int32) bool {
 	sc := &(s.slabClasses[slabClassIndex])
@@ -372,6 +444,7 @@ func (s *Arena) addSlab(
 	return true
 }
 
+// 将一个 chunk 推入空闲链表
 func (sc *slabClass) pushFreeChunk(c *chunk) {
 	if c.refs != 0 {
 		panic(fmt.Sprintf("pushFreeChunk() non-zero refs: %v", c.refs))
@@ -381,6 +454,7 @@ func (sc *slabClass) pushFreeChunk(c *chunk) {
 	sc.numChunksFree++
 }
 
+// 从空闲链表中弹出一个 chunk
 func (sc *slabClass) popFreeChunk() *chunk {
 	if sc.chunkFree.IsNil() {
 		panic("popFreeChunk() when chunkFree is nil")
@@ -399,6 +473,7 @@ func (sc *slabClass) popFreeChunk() *chunk {
 	return c
 }
 
+// 根据 chunk 的位置从 slab 内存中提取实际数据。
 func (sc *slabClass) chunkMem(c *chunk) []byte {
 	if c == nil || c.self.IsNil() {
 		return nil
@@ -407,6 +482,7 @@ func (sc *slabClass) chunkMem(c *chunk) []byte {
 	return sc.slabs[c.self.slabIndex].memory[beg : beg+sc.chunkSize]
 }
 
+// 根据 Loc 获取 chunk
 func (sc *slabClass) chunk(cl Loc) *chunk {
 	if cl.IsNil() {
 		return nil
@@ -423,15 +499,20 @@ func (s *Arena) chunk(cl Loc) (*slabClass, *chunk) {
 }
 
 // Determine the slabClass & chunk for an Arena managed buf []byte.
+//
+// 解析 buf 的 footer 来确定它所属的 slabClass 和 chunk 。
 func (s *Arena) bufChunk(buf []byte) (*slabClass, *chunk) {
 	if buf == nil || cap(buf) <= slabMemoryFooterLen {
 		return nil, nil
 	}
 
+	// 计算 footer 起始位置，位于 buf 的尾部 xx 字节
 	rest := buf[:cap(buf)]
 	footerDistance := len(rest) - slabMemoryFooterLen
 	footer := rest[footerDistance:]
 
+	// footer = slabClassIndex(4B) + slabIndex(4B) + slabMagic(4B)
+	// 其中 slabMagic 用于验证数据的合法性。
 	slabClassIndex := binary.BigEndian.Uint32(footer[0:4])
 	slabIndex := binary.BigEndian.Uint32(footer[4:8])
 	slabMagic := binary.BigEndian.Uint32(footer[8:12])
@@ -439,12 +520,17 @@ func (s *Arena) bufChunk(buf []byte) (*slabClass, *chunk) {
 		return nil, nil
 	}
 
-	sc := &(s.slabClasses[slabClassIndex])
-	slab := sc.slabs[slabIndex]
-	chunkIndex := len(slab.chunks) -
-		int(math.Ceil(float64(footerDistance)/float64(sc.chunkSize)))
+	// 先获取 slabClass ，再获取 slab ，
+	slabClass := &(s.slabClasses[slabClassIndex])
+	slab := slabClass.slabs[slabIndex]
 
-	return sc, &(slab.chunks[chunkIndex])
+	// [重要]
+	// 为了找到 buf 对应的 chunk，需要确定 buf 在 slab 中的位置。
+	//
+	// footerDistance / slabClass.chunkSize 计算了 footerDistance 涉及的 chunk 数量，可能会得到一个浮点数。
+	// math.Ceil 确保即使 footerDistance 不是 chunkSize 的整数倍，也能计算得到整数 chunkIndex 。
+	chunkIndex := len(slab.chunks) - int(math.Ceil(float64(footerDistance)/float64(slabClass.chunkSize))) /// ???
+	return slabClass, &(slab.chunks[chunkIndex])
 }
 
 func (c *chunk) addRef() *chunk {
@@ -455,6 +541,7 @@ func (c *chunk) addRef() *chunk {
 	return c
 }
 
+// 减少 chunk 的引用计数。如果引用计数降到 0，将 chunk 推入空闲链表
 func (s *Arena) decRef(sc *slabClass, c *chunk) bool {
 	c.refs--
 	if c.refs < 0 {
