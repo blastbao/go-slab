@@ -399,16 +399,23 @@ func (s *Arena) addSlabClass(chunkSize int) {
 // 为指定的 slabClass 添加新的 slab 。
 // 初始化 slab 内存，并将其划分为 chunk 。
 func (s *Arena) addSlab(
-	slabClassIndex, slabSize int, slabMagic int32) bool {
+	slabClassIndex,
+	slabSize int,
+	slabMagic int32,
+) bool {
+
+	// 获取 Slab Class
 	sc := &(s.slabClasses[slabClassIndex])
 
-	chunksPerSlab := slabSize / sc.chunkSize
-	if chunksPerSlab <= 0 {
+	// 计算每个 Slab 可以包含的 Chunk 数量
+	chunksPerSlab := slabSize / sc.chunkSize // chunksPerSlab 表示在给定的 slabSize 下，每个 slab 可以容纳多少个 chunk 。
+	if chunksPerSlab <= 0 {                  // 如果 chunksPerSlab 计算结果小于等于 0，则设置为 1，确保每个 slab 至少能容纳一个 chunk 。
 		chunksPerSlab = 1
 	}
 
 	slabIndex := len(sc.slabs)
 
+	// 分配内存
 	s.totMallocs++
 	// Re-multiplying to avoid any extra fractional chunk memory.
 	memorySize := (sc.chunkSize * chunksPerSlab) + slabMemoryFooterLen
@@ -418,27 +425,35 @@ func (s *Arena) addSlab(
 		return false
 	}
 
+	// 初始化 Slab
 	slab := &slab{
 		memory: memory,
 		chunks: make([]chunk, chunksPerSlab),
 	}
 
+	// 设置 Slab 的 Footer
 	footer := slab.memory[len(slab.memory)-slabMemoryFooterLen:]
 	binary.BigEndian.PutUint32(footer[0:4], uint32(slabClassIndex))
 	binary.BigEndian.PutUint32(footer[4:8], uint32(slabIndex))
 	binary.BigEndian.PutUint32(footer[8:12], uint32(slabMagic))
 
+	// 将 Slab 添加到 SC 中
 	sc.slabs = append(sc.slabs, slab)
 
+	// 初始化 Chunk
 	for i := 0; i < len(slab.chunks); i++ {
 		c := &(slab.chunks[i])
+		// 为每个 chunk 设置其属性（如所属的 slab 类别、索引、chunk 的索引等）
 		c.self.slabClassIndex = slabClassIndex
 		c.self.slabIndex = slabIndex
 		c.self.chunkIndex = i
 		c.self.bufStart = 0
 		c.self.bufLen = sc.chunkSize
+		// 调用 sc.pushFreeChunk(c) 将 chunk 标记为“空闲”，准备供以后使用。
 		sc.pushFreeChunk(c)
 	}
+
+	// 更新统计信息
 	sc.numChunks += int64(len(slab.chunks))
 
 	return true
@@ -456,16 +471,38 @@ func (sc *slabClass) pushFreeChunk(c *chunk) {
 
 // 从空闲链表中弹出一个 chunk
 func (sc *slabClass) popFreeChunk() *chunk {
+	// 1. 检查空闲链表是否为空
+	// 	sc.chunkFree 是 slabClass 内部维护的一个链表，存储着所有空闲的 chunk 。
+	// 	如果 chunkFree 为 nilLoc（即链表为空），则表示没有空闲的 chunk。
 	if sc.chunkFree.IsNil() {
 		panic("popFreeChunk() when chunkFree is nil")
 	}
+
+	// 2. 获取 chunk
+	//	通过 sc.chunk(sc.chunkFree) 获取当前链表中的第一个 chunk 。
 	c := sc.chunk(sc.chunkFree)
+
+	// 3. 检查引用计数
+	//	在弹出 chunk 之前，代码检查其引用计数 c.refs 是否为 0 。
+	//	chunk 应该是空闲的，因此引用计数应该为 0 ，如果不是，说明这个 chunk 可能被其他地方引用，可能存在数据一致性问题，此时会触发 panic 。
 	if c.refs != 0 {
 		panic(fmt.Sprintf("popFreeChunk() non-zero refs: %v", c.refs))
 	}
+
+	// 4. 设置引用计数
+	//	将 chunk 的引用计数 c.refs 设置为 1 ，因为它现在被“弹出”并正在使用。
+	//	这样做可以确保 chunk 在被使用期间不会被回收。
 	c.refs = 1
+
+	// 5. 更新链表
+	//	将 sc.chunkFree 更新为 c.next，即将链表的头指针指向下一个 chunk 。
+	//	将 c.next 设置为 nilLoc ，表示这个 chunk 不再在链表中。
 	sc.chunkFree = c.next
 	c.next = nilLoc
+
+	// 6. 更新空闲 chunk 数量
+	//	减少 numChunksFree 计数器的值，表示一个空闲的 chunk 被弹出。
+	//	接着，检查 numChunksFree 是否小于 0 。如果小于 0，说明空闲 chunk 的数量出现了不一致的情况，函数会引发 panic 。
 	sc.numChunksFree--
 	if sc.numChunksFree < 0 {
 		panic("popFreeChunk() got < 0 numChunksFree")
@@ -475,10 +512,25 @@ func (sc *slabClass) popFreeChunk() *chunk {
 
 // 根据 chunk 的位置从 slab 内存中提取实际数据。
 func (sc *slabClass) chunkMem(c *chunk) []byte {
+
+	// 检查有效性：
+	//	如果 c 是 nil，说明没有有效的 chunk，直接返回 nil 。
+	//	如果 c.self 是 nil，说明 chunk 的元数据无效，也应返回 nil。
 	if c == nil || c.self.IsNil() {
 		return nil
 	}
+
+	// 计算起始位置：
+	//	sc.chunkSize：每个 chunk 的大小。
+	//	c.self.chunkIndex：chunk 在某个数据结构中的索引。
+	//	beg：计算出 chunk 在内存中的起始字节位置，单位是字节。这个位置是通过 chunk 大小和索引乘积得出的。
 	beg := sc.chunkSize * c.self.chunkIndex
+
+	// 提取内存区域：
+	//	sc.slabs：slabClass 中存储的所有 slab 对象的数组。
+	//	c.self.slabIndex：chunk 在 slabs 数组中的位置索引。根据这个索引获取具体的 slab。
+	//	sc.slabs[c.self.slabIndex].memory：获取 slab 对象的内存区域，它是一个字节切片 ([]byte)，表示整个 slab 的内存。
+	//	beg : beg+sc.chunkSize：使用切片操作提取从 beg 到 beg+sc.chunkSize 的内存区域。这样可以获取到 chunk 在 slab 内存区域中的实际数据部分。
 	return sc.slabs[c.self.slabIndex].memory[beg : beg+sc.chunkSize]
 }
 
