@@ -21,7 +21,7 @@ import (
 
 // Slab: 包含多个 chunk，chunk 是 slab 中的基本内存单元。
 // Buf: 从某个 chunk 中分配出来的内存块。
-// Footer: 存储在 buf 末尾的元数据，其中包含 slabClassIndex、slabIndex 和 slabMagic 等信息。
+// Footer: 存储在 slab 末尾的元数据，其中包含 slabClassIndex、slabIndex 和 slabMagic 等信息。
 
 // Loc
 // An opaque reference to bytes managed by an Arena.  See
@@ -552,20 +552,21 @@ func (s *Arena) chunk(cl Loc) (*slabClass, *chunk) {
 
 // Determine the slabClass & chunk for an Arena managed buf []byte.
 //
-// 解析 buf 的 footer 来确定它所属的 slabClass 和 chunk 。
+// [重要]
+// 一个 slot 是一个完整的 memory ，水平划分多若干 bunk ，这些 bunk 来自同一个 byte[sizeof(slot)] ，这个切片尾部存储着 slot footer 。
+// 要确认一个 buf 是否属于某个 slot ，只需要定位到其所属 []byte 切片的 footer ，比较其 magic 是否匹配，进而定位到 slot class, slot index 。
 func (s *Arena) bufChunk(buf []byte) (*slabClass, *chunk) {
 	if buf == nil || cap(buf) <= slabMemoryFooterLen {
 		return nil, nil
 	}
 
-	// 计算 footer 起始位置，位于 buf 的尾部 xx 字节
+	// 计算 slot footer 起始位置，位于尾部 12 字节
 	rest := buf[:cap(buf)]
-	footerDistance := len(rest) - slabMemoryFooterLen
+	footerDistance := len(rest) - slabMemoryFooterLen // 重要: 计算
 	footer := rest[footerDistance:]
 
-	// footer = slabClassIndex(4B) + slabIndex(4B) + slabMagic(4B)
-	// 其中 slabMagic 用于验证数据的合法性。
-	slabClassIndex := binary.BigEndian.Uint32(footer[0:4])
+	// 提取 Magic 验证其是否来自 slot
+	scIndex := binary.BigEndian.Uint32(footer[0:4])
 	slabIndex := binary.BigEndian.Uint32(footer[4:8])
 	slabMagic := binary.BigEndian.Uint32(footer[8:12])
 	if slabMagic != uint32(s.slabMagic) {
@@ -573,16 +574,12 @@ func (s *Arena) bufChunk(buf []byte) (*slabClass, *chunk) {
 	}
 
 	// 先获取 slabClass ，再获取 slab ，
-	slabClass := &(s.slabClasses[slabClassIndex])
-	slab := slabClass.slabs[slabIndex]
+	class := &(s.slabClasses[scIndex])
+	slab := class.slabs[slabIndex]
 
-	// [重要]
 	// 为了找到 buf 对应的 chunk，需要确定 buf 在 slab 中的位置。
-	//
-	// footerDistance / slabClass.chunkSize 计算了 footerDistance 涉及的 chunk 数量，可能会得到一个浮点数。
-	// math.Ceil 确保即使 footerDistance 不是 chunkSize 的整数倍，也能计算得到整数 chunkIndex 。
-	chunkIndex := len(slab.chunks) - int(math.Ceil(float64(footerDistance)/float64(slabClass.chunkSize))) /// ???
-	return slabClass, &(slab.chunks[chunkIndex])
+	chunkIndex := len(slab.chunks) - int(math.Ceil(float64(footerDistance)/float64(class.chunkSize)))
+	return class, &(slab.chunks[chunkIndex])
 }
 
 func (c *chunk) addRef() *chunk {
